@@ -7,6 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use thiserror::Error;
 
+#[cfg(feature = "perf-stats")]
+mod stats;
+
+#[cfg(feature = "perf-stats")]
+pub use stats::{ConsumerStatsSnapshot, FeederStatsSnapshot, SchedulerStatsSnapshot};
+
 const RUNNING: u8 = 0;
 const SHUTTING_DOWN: u8 = 1;
 const CANCELLED: u8 = 2;
@@ -116,6 +122,8 @@ pub enum AccessError {
     NoMoreWork,
     #[error("scheduler stopped")]
     SchedulerStopped,
+    #[error("low water mark must be less than high water mark")]
+    InvalidWaterMarks,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -170,9 +178,13 @@ pub struct FeederRx<T: Send + 'static, S: StatusSink = NoStatus> {
     data_rx: Mutex<Option<Receiver<T>>>,
     demand_tx: Sender<DemandCommand>,
     in_flight: Arc<AtomicUsize>,
+    low_water: usize,
+    high_water: usize,
     shared: Arc<Shared<T, S>>,
     lagging: AtomicBool,
     dropped: AtomicBool,
+    #[cfg(feature = "perf-stats")]
+    consumer_stats: Arc<stats::ConsumerStats>,
 }
 
 struct Shared<T: Send + 'static, S: StatusSink> {
@@ -183,6 +195,10 @@ struct Shared<T: Send + 'static, S: StatusSink> {
     control_tx: Sender<ControlCommand<T>>,
     scheduler: Mutex<Option<JoinHandle<()>>>,
     status: S,
+    #[cfg(feature = "perf-stats")]
+    scheduler_stats: Arc<stats::SchedulerStats>,
+    #[cfg(feature = "perf-stats")]
+    consumer_stats: Mutex<Vec<Arc<stats::ConsumerStats>>>,
 }
 
 struct ReceiverState<T> {
@@ -205,7 +221,6 @@ enum ControlCommand<T> {
         receiver_id: ReceiverId,
         data_tx: Sender<T>,
         in_flight: Arc<AtomicUsize>,
-        initial_prefetch: usize,
     },
     ReceiverDropped {
         receiver_id: ReceiverId,
@@ -225,6 +240,9 @@ fn build_feeder<T: Send + 'static, S: StatusSink>(status: S) -> Feeder<T, S> {
     let (demand_tx, demand_rx) = crossbeam_channel::unbounded();
     let (control_tx, control_rx) = crossbeam_channel::unbounded();
 
+    #[cfg(feature = "perf-stats")]
+    let scheduler_stats = Arc::new(stats::SchedulerStats::default());
+
     let shared = Arc::new(Shared {
         next_id: AtomicUsize::new(1),
         lifecycle: AtomicU8::new(RUNNING),
@@ -233,6 +251,10 @@ fn build_feeder<T: Send + 'static, S: StatusSink>(status: S) -> Feeder<T, S> {
         control_tx: control_tx.clone(),
         scheduler: Mutex::new(None),
         status: status.clone(),
+        #[cfg(feature = "perf-stats")]
+        scheduler_stats: Arc::clone(&scheduler_stats),
+        #[cfg(feature = "perf-stats")]
+        consumer_stats: Mutex::new(Vec::new()),
     });
 
     let shared_scheduler = Arc::clone(&shared);
@@ -266,16 +288,23 @@ fn receiver_ready<T>(receivers: &HashMap<ReceiverId, ReceiverState<T>>, id: Rece
     receivers.get(&id).is_some_and(|s| s.active)
 }
 
-fn queue_demand<T>(
+#[allow(unused_variables)]
+fn queue_demand<T: Send + 'static, S: StatusSink>(
     head: &mut Option<HeadDemand>,
     pending: &mut VecDeque<HeadDemand>,
     receivers: &HashMap<ReceiverId, ReceiverState<T>>,
+    shared: &Shared<T, S>,
     receiver_id: ReceiverId,
     count: usize,
 ) {
     if count == 0 {
         return;
     }
+    #[cfg(feature = "perf-stats")]
+    shared
+        .scheduler_stats
+        .demand_queued
+        .fetch_add(1, Ordering::Relaxed);
     let demand = HeadDemand {
         receiver_id,
         remaining: count,
@@ -291,11 +320,18 @@ fn queue_demand<T>(
     }
 }
 
-fn advance_head_demand<T>(
+#[allow(unused_variables)]
+fn advance_head_demand<T: Send + 'static, S: StatusSink>(
     head: &mut Option<HeadDemand>,
     pending: &mut VecDeque<HeadDemand>,
     receivers: &HashMap<ReceiverId, ReceiverState<T>>,
+    shared: &Shared<T, S>,
 ) {
+    #[cfg(feature = "perf-stats")]
+    shared
+        .scheduler_stats
+        .head_advanced
+        .fetch_add(1, Ordering::Relaxed);
     if let Some(current) = head.as_ref() {
         if receiver_ready(receivers, current.receiver_id) {
             return;
@@ -310,10 +346,12 @@ fn advance_head_demand<T>(
     }
 }
 
-fn fulfill_from_recovered<T>(
+#[allow(unused_variables)]
+fn fulfill_from_recovered<T: Send + 'static, S: StatusSink>(
     head: &mut HeadDemand,
     receivers: &mut HashMap<ReceiverId, ReceiverState<T>>,
     recovered: &mut VecDeque<T>,
+    shared: &Shared<T, S>,
 ) -> bool {
     let rid = head.receiver_id;
     let Some(state) = receivers.get_mut(&rid) else {
@@ -322,6 +360,8 @@ fn fulfill_from_recovered<T>(
     if !state.active {
         return false;
     }
+    #[cfg(feature = "perf-stats")]
+    let remaining_before = head.remaining;
     while head.remaining > 0 {
         let Some(item) = recovered.pop_front() else {
             break;
@@ -333,6 +373,13 @@ fn fulfill_from_recovered<T>(
             return false;
         }
     }
+    #[cfg(feature = "perf-stats")]
+    {
+        let fulfilled = remaining_before.saturating_sub(head.remaining);
+        shared
+            .scheduler_stats
+            .inc_recovered_fulfilled(fulfilled as u64);
+    }
     true
 }
 
@@ -342,6 +389,184 @@ fn drop_receiver_senders<T>(receivers: &mut HashMap<ReceiverId, ReceiverState<T>
         let (tx, _) = crossbeam_channel::unbounded();
         drop(std::mem::replace(&mut state.data_tx, tx));
     }
+}
+
+fn route_ingress_item<T: Send + 'static, S: StatusSink>(
+    item: T,
+    receiver_id: ReceiverId,
+    head_demand: &mut Option<HeadDemand>,
+    pending_demands: &mut VecDeque<HeadDemand>,
+    receivers: &mut HashMap<ReceiverId, ReceiverState<T>>,
+    shared: &Shared<T, S>,
+) {
+    if let Some(state) = receivers.get_mut(&receiver_id) {
+        if state.active && state.data_tx.send(item).is_ok() {
+            state.in_flight.fetch_add(1, Ordering::SeqCst);
+            #[cfg(feature = "perf-stats")]
+            shared.scheduler_stats.inc_ingress_routed(1);
+            if let Some(h) = head_demand.as_mut() {
+                h.remaining = h.remaining.saturating_sub(1);
+                if h.remaining == 0 {
+                    head_demand.take();
+                    advance_head_demand(head_demand, pending_demands, receivers, shared);
+                }
+            }
+        }
+    }
+}
+
+fn fulfill_head_from_ingress<T: Send + 'static, S: StatusSink>(
+    head_demand: &mut Option<HeadDemand>,
+    pending_demands: &mut VecDeque<HeadDemand>,
+    receivers: &mut HashMap<ReceiverId, ReceiverState<T>>,
+    ingress_rx: &Receiver<T>,
+    control_rx: &Receiver<ControlCommand<T>>,
+    shared: &Shared<T, S>,
+    ingress_closed: &mut bool,
+    recovered: &mut VecDeque<T>,
+    graceful_shutdown: &mut bool,
+    cancelled: &mut bool,
+) -> bool {
+    loop {
+        let Some(receiver_id) = head_demand.as_ref().map(|h| h.receiver_id) else {
+            return false;
+        };
+        if head_demand.as_ref().is_none_or(|h| h.remaining == 0) {
+            return false;
+        }
+
+        match ingress_rx.try_recv() {
+            Ok(item) => {
+                #[cfg(feature = "perf-stats")]
+                shared
+                    .scheduler_stats
+                    .select_ingress_wins
+                    .fetch_add(1, Ordering::Relaxed);
+                route_ingress_item(
+                    item,
+                    receiver_id,
+                    head_demand,
+                    pending_demands,
+                    receivers,
+                    shared,
+                );
+            }
+            Err(TryRecvError::Empty) => {
+                crossbeam_channel::select! {
+                    recv(ingress_rx) -> msg => {
+                        #[cfg(feature = "perf-stats")]
+                        shared
+                            .scheduler_stats
+                            .select_ingress_wins
+                            .fetch_add(1, Ordering::Relaxed);
+                        match msg {
+                            Ok(item) => {
+                                route_ingress_item(
+                                    item,
+                                    receiver_id,
+                                    head_demand,
+                                    pending_demands,
+                                    receivers,
+                                    shared,
+                                );
+                            }
+                            Err(RecvError) => {
+                                *ingress_closed = true;
+                                #[cfg(feature = "perf-stats")]
+                                shared
+                                    .scheduler_stats
+                                    .ingress_closed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return false;
+                            }
+                        }
+                    }
+                    recv(control_rx) -> cmd => {
+                        #[cfg(feature = "perf-stats")]
+                        shared
+                            .scheduler_stats
+                            .select_control_wins
+                            .fetch_add(1, Ordering::Relaxed);
+                        if handle_scheduler_control(
+                            cmd,
+                            receivers,
+                            recovered,
+                            head_demand,
+                            pending_demands,
+                            shared,
+                            graceful_shutdown,
+                            cancelled,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                *ingress_closed = true;
+                #[cfg(feature = "perf-stats")]
+                shared
+                    .scheduler_stats
+                    .ingress_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+    }
+}
+
+fn handle_scheduler_control<T: Send + 'static, S: StatusSink>(
+    cmd: Result<ControlCommand<T>, RecvError>,
+    receivers: &mut HashMap<ReceiverId, ReceiverState<T>>,
+    recovered: &mut VecDeque<T>,
+    head_demand: &mut Option<HeadDemand>,
+    pending_demands: &mut VecDeque<HeadDemand>,
+    shared: &Shared<T, S>,
+    graceful_shutdown: &mut bool,
+    cancelled: &mut bool,
+) -> bool {
+    match cmd {
+        Ok(ControlCommand::RegisterReceiver {
+            receiver_id,
+            data_tx,
+            in_flight,
+        }) => {
+            receivers.insert(
+                receiver_id,
+                ReceiverState {
+                    data_tx,
+                    in_flight,
+                    active: true,
+                },
+            );
+            advance_head_demand(head_demand, pending_demands, receivers, shared);
+        }
+        Ok(ControlCommand::ReceiverDropped { receiver_id, data_rx }) => {
+            recover_receiver(
+                receiver_id,
+                data_rx,
+                receivers,
+                recovered,
+                &shared.status,
+            );
+        }
+        Ok(ControlCommand::GracefulShutdown) => {
+            *graceful_shutdown = true;
+        }
+        Ok(ControlCommand::Cancel) => {
+            *cancelled = true;
+            shared.lifecycle.store(CANCELLED, Ordering::SeqCst);
+            shared.status.cancelled();
+            drop_receiver_senders(receivers);
+            receivers.clear();
+            recovered.clear();
+            head_demand.take();
+            pending_demands.clear();
+            return true;
+        }
+        Err(_) => {}
+    }
+    false
 }
 
 fn run_scheduler<T: Send + 'static, S: StatusSink>(
@@ -359,59 +584,6 @@ fn run_scheduler<T: Send + 'static, S: StatusSink>(
     let mut graceful_shutdown = false;
     let mut demand_closed = false;
 
-    let handle_control = |cmd: Result<ControlCommand<T>, RecvError>,
-                            receivers: &mut HashMap<ReceiverId, ReceiverState<T>>,
-                            recovered: &mut VecDeque<T>,
-                            head_demand: &mut Option<HeadDemand>,
-                            pending_demands: &mut VecDeque<HeadDemand>,
-                            graceful_shutdown: &mut bool,
-                            cancelled: &mut bool|
-     -> bool {
-        match cmd {
-            Ok(ControlCommand::RegisterReceiver {
-                receiver_id,
-                data_tx,
-                in_flight,
-                initial_prefetch: _,
-            }) => {
-                receivers.insert(
-                    receiver_id,
-                    ReceiverState {
-                        data_tx,
-                        in_flight,
-                        active: true,
-                    },
-                );
-                advance_head_demand(head_demand, pending_demands, receivers);
-            }
-            Ok(ControlCommand::ReceiverDropped { receiver_id, data_rx }) => {
-                recover_receiver(
-                    receiver_id,
-                    data_rx,
-                    receivers,
-                    recovered,
-                    &shared.status,
-                );
-            }
-            Ok(ControlCommand::GracefulShutdown) => {
-                *graceful_shutdown = true;
-            }
-            Ok(ControlCommand::Cancel) => {
-                *cancelled = true;
-                shared.lifecycle.store(CANCELLED, Ordering::SeqCst);
-                shared.status.cancelled();
-                drop_receiver_senders(receivers);
-                receivers.clear();
-                recovered.clear();
-                head_demand.take();
-                pending_demands.clear();
-                return true;
-            }
-            Err(_) => {}
-        }
-        false
-    };
-
     'outer: loop {
         if cancelled {
             break;
@@ -427,6 +599,7 @@ fn run_scheduler<T: Send + 'static, S: StatusSink>(
                         &mut head_demand,
                         &mut pending_demands,
                         &receivers,
+                        &shared,
                         receiver_id,
                         count,
                     );
@@ -440,30 +613,33 @@ fn run_scheduler<T: Send + 'static, S: StatusSink>(
             if !receiver_ready(&receivers, head.receiver_id) {
                 let stale = head_demand.take().unwrap();
                 pending_demands.push_back(stale);
-                advance_head_demand(&mut head_demand, &mut pending_demands, &receivers);
+                #[cfg(feature = "perf-stats")]
+                shared
+                    .scheduler_stats
+                    .head_stale
+                    .fetch_add(1, Ordering::Relaxed);
+                advance_head_demand(&mut head_demand, &mut pending_demands, &receivers, &shared);
                 continue;
             }
 
             if let Some(head) = head_demand.as_mut() {
-                fulfill_from_recovered(head, &mut receivers, &mut recovered);
+                fulfill_from_recovered(head, &mut receivers, &mut recovered, &shared);
             }
 
             if let Some(head) = head_demand.as_ref() {
                 if head.remaining == 0 {
                     head_demand.take();
-                    advance_head_demand(&mut head_demand, &mut pending_demands, &receivers);
+                    advance_head_demand(&mut head_demand, &mut pending_demands, &receivers, &shared);
                     continue;
                 }
             } else {
                 continue;
             }
 
-            let rid = head_demand.as_ref().unwrap().receiver_id;
-
             if ingress_closed && recovered.is_empty() {
                 if head_demand.as_ref().is_some_and(|h| h.remaining > 0) {
                     head_demand.take();
-                    advance_head_demand(&mut head_demand, &mut pending_demands, &receivers);
+                    advance_head_demand(&mut head_demand, &mut pending_demands, &receivers, &shared);
                     continue;
                 }
                 let no_demand = head_demand.is_none() && pending_demands.is_empty();
@@ -479,45 +655,19 @@ fn run_scheduler<T: Send + 'static, S: StatusSink>(
                 }
             }
 
-            crossbeam_channel::select! {
-                recv(ingress_rx) -> msg => {
-                    match msg {
-                        Ok(item) => {
-                            if let Some(state) = receivers.get_mut(&rid) {
-                                if state.active && state.data_tx.send(item).is_ok() {
-                                    state.in_flight.fetch_add(1, Ordering::SeqCst);
-                                    if let Some(h) = &mut head_demand {
-                                        h.remaining = h.remaining.saturating_sub(1);
-                                        if h.remaining == 0 {
-                                            head_demand.take();
-                                            advance_head_demand(
-                                                &mut head_demand,
-                                                &mut pending_demands,
-                                                &receivers,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(RecvError) => {
-                            ingress_closed = true;
-                        }
-                    }
-                }
-                recv(control_rx) -> cmd => {
-                    if handle_control(
-                        cmd,
-                        &mut receivers,
-                        &mut recovered,
-                        &mut head_demand,
-                        &mut pending_demands,
-                        &mut graceful_shutdown,
-                        &mut cancelled,
-                    ) {
-                        break 'outer;
-                    }
-                }
+            if fulfill_head_from_ingress(
+                &mut head_demand,
+                &mut pending_demands,
+                &mut receivers,
+                &ingress_rx,
+                &control_rx,
+                &shared,
+                &mut ingress_closed,
+                &mut recovered,
+                &mut graceful_shutdown,
+                &mut cancelled,
+            ) {
+                break 'outer;
             }
             continue;
         }
@@ -536,12 +686,18 @@ fn run_scheduler<T: Send + 'static, S: StatusSink>(
 
         crossbeam_channel::select! {
             recv(demand_rx) -> d => {
+                #[cfg(feature = "perf-stats")]
+                shared
+                    .scheduler_stats
+                    .select_demand_wins
+                    .fetch_add(1, Ordering::Relaxed);
                 match d {
                     Ok(DemandCommand::Request { receiver_id, count }) => {
                         queue_demand(
                             &mut head_demand,
                             &mut pending_demands,
                             &receivers,
+                            &shared,
                             receiver_id,
                             count,
                         );
@@ -550,19 +706,31 @@ fn run_scheduler<T: Send + 'static, S: StatusSink>(
                 }
             }
             recv(control_rx) -> cmd => {
-                if handle_control(
+                #[cfg(feature = "perf-stats")]
+                shared
+                    .scheduler_stats
+                    .select_control_wins
+                    .fetch_add(1, Ordering::Relaxed);
+                if handle_scheduler_control(
                     cmd,
                     &mut receivers,
                     &mut recovered,
                     &mut head_demand,
                     &mut pending_demands,
+                    &shared,
                     &mut graceful_shutdown,
                     &mut cancelled,
                 ) {
                     break 'outer;
                 }
             }
-            default(std::time::Duration::from_millis(1)) => {}
+            default(std::time::Duration::from_millis(1)) => {
+                #[cfg(feature = "perf-stats")]
+                shared
+                    .scheduler_stats
+                    .select_idle_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -669,7 +837,17 @@ impl<T: Send + 'static, S: StatusSink> Feeder<T, S> {
         }
     }
 
-    pub fn rx(&self, prefetch: NonZeroUsize) -> Result<FeederRx<T, S>, AccessError> {
+    pub fn rx(
+        &self,
+        low: NonZeroUsize,
+        high: NonZeroUsize,
+    ) -> Result<FeederRx<T, S>, AccessError> {
+        let low_water = low.get();
+        let high_water = high.get();
+        if low_water >= high_water {
+            return Err(AccessError::InvalidWaterMarks);
+        }
+
         let state = lifecycle(&self.shared);
         match state {
             CANCELLED => return Err(AccessError::Cancelled),
@@ -688,7 +866,6 @@ impl<T: Send + 'static, S: StatusSink> Feeder<T, S> {
                 receiver_id,
                 data_tx,
                 in_flight: Arc::clone(&in_flight),
-                initial_prefetch: prefetch.get(),
             })
             .map_err(|_| AccessError::SchedulerStopped)?;
 
@@ -696,21 +873,57 @@ impl<T: Send + 'static, S: StatusSink> Feeder<T, S> {
             .demand_tx
             .send(DemandCommand::Request {
                 receiver_id,
-                count: prefetch.get(),
+                count: high_water,
             })
             .map_err(|_| AccessError::SchedulerStopped)?;
 
         self.shared.status.receiver_registered(receiver_id);
+
+        #[cfg(feature = "perf-stats")]
+        let consumer_stats = Arc::new(stats::ConsumerStats::default());
+        #[cfg(feature = "perf-stats")]
+        self.shared
+            .consumer_stats
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&consumer_stats));
 
         Ok(FeederRx {
             receiver_id,
             data_rx: Mutex::new(Some(data_rx)),
             demand_tx: self.shared.demand_tx.clone(),
             in_flight,
+            low_water,
+            high_water,
             shared: Arc::clone(&self.shared),
             lagging: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
+            #[cfg(feature = "perf-stats")]
+            consumer_stats,
         })
+    }
+
+    #[cfg(feature = "perf-stats")]
+    pub fn stats_snapshot(&self) -> FeederStatsSnapshot {
+        let mut consumers = ConsumerStatsSnapshot::default();
+        for c in self.shared.consumer_stats.lock().unwrap().iter() {
+            let s = c.snapshot();
+            consumers.get_calls += s.get_calls;
+            consumers.items_consumed += s.items_consumed;
+            consumers.refill_messages += s.refill_messages;
+        }
+        FeederStatsSnapshot {
+            scheduler: self.shared.scheduler_stats.snapshot(),
+            consumers,
+        }
+    }
+
+    #[cfg(feature = "perf-stats")]
+    pub fn reset_stats(&self) {
+        self.shared.scheduler_stats.reset();
+        for c in self.shared.consumer_stats.lock().unwrap().iter() {
+            c.reset();
+        }
     }
 
     pub fn graceful_shutdown(&self) {
@@ -776,7 +989,16 @@ impl<T: Send + 'static, S: StatusSink> FeederRx<T, S> {
 
         let consumed = items.len();
         self.in_flight.fetch_sub(consumed, Ordering::SeqCst);
-        self.send_refill(consumed);
+        #[cfg(feature = "perf-stats")]
+        {
+            self.consumer_stats
+                .get_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.consumer_stats
+                .items_consumed
+                .fetch_add(consumed as u64, Ordering::Relaxed);
+        }
+        self.maybe_request_refill(rx);
         self.update_lag(max_usize, consumed);
 
         Ok(items)
@@ -812,7 +1034,16 @@ impl<T: Send + 'static, S: StatusSink> FeederRx<T, S> {
 
         let consumed = items.len();
         self.in_flight.fetch_sub(consumed, Ordering::SeqCst);
-        self.send_refill(consumed);
+        #[cfg(feature = "perf-stats")]
+        {
+            self.consumer_stats
+                .get_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.consumer_stats
+                .items_consumed
+                .fetch_add(consumed as u64, Ordering::Relaxed);
+        }
+        self.maybe_request_refill(rx);
         self.update_lag(max_usize, consumed);
 
         TryGet::Items(items)
@@ -832,10 +1063,19 @@ impl<T: Send + 'static, S: StatusSink> FeederRx<T, S> {
         self.notify_drop();
     }
 
-    fn send_refill(&self, count: usize) {
+    fn maybe_request_refill(&self, data_rx: &Receiver<T>) {
+        let len = data_rx.len();
+        if len >= self.low_water {
+            return;
+        }
+        let count = self.high_water.saturating_sub(len);
         if count == 0 {
             return;
         }
+        #[cfg(feature = "perf-stats")]
+        self.consumer_stats
+            .refill_messages
+            .fetch_add(1, Ordering::Relaxed);
         let _ = self.demand_tx.send(DemandCommand::Request {
             receiver_id: self.receiver_id,
             count,
@@ -920,6 +1160,39 @@ mod tests {
         Feeder::<T, NoStatus>::builder().build()
     }
 
+    fn water(low: usize, high: usize) -> (NonZeroUsize, NonZeroUsize) {
+        (NonZeroUsize::new(low).unwrap(), NonZeroUsize::new(high).unwrap())
+    }
+
+    #[test]
+    fn rx_rejects_invalid_water_marks() {
+        let feeder = make_feeder::<i32>();
+        assert!(matches!(
+            feeder.rx(water(2, 2).0, water(2, 2).1),
+            Err(AccessError::InvalidWaterMarks)
+        ));
+        assert!(matches!(
+            feeder.rx(water(3, 2).0, water(3, 2).1),
+            Err(AccessError::InvalidWaterMarks)
+        ));
+    }
+
+    #[test]
+    fn refill_signals_only_below_low_water() {
+        let feeder = make_feeder::<i32>();
+        let rx = feeder.rx(water(2, 4).0, water(2, 4).1).unwrap();
+        let tx = feeder.tx().unwrap();
+        for i in 0..4 {
+            tx.send(i).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let batch = rx.get(NonZeroUsize::new(2).unwrap()).unwrap();
+        assert_eq!(batch.len(), 2);
+        std::thread::sleep(Duration::from_millis(50));
+        let one = rx.get_one().unwrap();
+        assert_eq!(one, 2);
+    }
+
     #[test]
     fn tx_returns_sender_while_running() {
         let feeder = make_feeder::<i32>();
@@ -937,7 +1210,7 @@ mod tests {
     fn rx_allowed_during_graceful_shutdown() {
         let feeder = make_feeder::<i32>();
         feeder.graceful_shutdown();
-        assert!(feeder.rx(NonZeroUsize::new(1).unwrap()).is_ok());
+        assert!(feeder.rx(water(1, 2).0, water(1, 2).1).is_ok());
     }
 
     #[test]
@@ -946,7 +1219,7 @@ mod tests {
         feeder.cancel();
         std::thread::sleep(Duration::from_millis(50));
         assert!(matches!(
-            feeder.rx(NonZeroUsize::new(1).unwrap()),
+            feeder.rx(water(1, 2).0, water(1, 2).1),
             Err(AccessError::Cancelled)
         ));
     }
@@ -954,7 +1227,7 @@ mod tests {
     #[test]
     fn get_returns_non_empty_vec_up_to_max() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         for i in 0..5 {
             tx.send(i).unwrap();
@@ -967,7 +1240,7 @@ mod tests {
     #[test]
     fn get_one_returns_single_item() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(42).unwrap();
         assert_eq!(rx.get_one().unwrap(), 42);
@@ -976,14 +1249,14 @@ mod tests {
     #[test]
     fn try_get_empty_while_running() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         assert!(matches!(rx.try_get(NonZeroUsize::new(3).unwrap()), TryGet::Empty));
     }
 
     #[test]
     fn try_get_in_shutdown_when_empty_and_shutdown_started() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(1).unwrap();
         let _ = rx.get_one().unwrap();
@@ -997,7 +1270,7 @@ mod tests {
     #[test]
     fn try_get_no_more_work_after_final_drain() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(1).unwrap();
         let _ = rx.get_one().unwrap();
@@ -1018,7 +1291,7 @@ mod tests {
     #[test]
     fn cancel_wakes_blocking_get() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let feeder2 = feeder.clone();
         let handle = std::thread::spawn(move || rx.get_one());
         std::thread::sleep(Duration::from_millis(50));
@@ -1029,7 +1302,7 @@ mod tests {
     #[test]
     fn receiver_refills_only_consumed_count() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(2).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(1).unwrap();
         tx.send(2).unwrap();
@@ -1044,14 +1317,14 @@ mod tests {
     #[test]
     fn recovered_work_is_prioritized_before_ingress() {
         let feeder = make_feeder::<i32>();
-        let rx1 = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx1 = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(100).unwrap();
         let _ = rx1.get_one().unwrap();
         tx.send(200).unwrap();
         drop(rx1);
         std::thread::sleep(Duration::from_millis(50));
-        let rx2 = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx2 = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         tx.send(300).unwrap();
         let first = rx2.get_one().unwrap();
         assert_eq!(first, 200);
@@ -1060,7 +1333,7 @@ mod tests {
     #[test]
     fn receiver_drop_recovers_buffered_items_without_loss() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(5).unwrap()).unwrap();
+        let rx = feeder.rx(water(2, 5).0, water(2, 5).1).unwrap();
         let tx = feeder.tx().unwrap();
         for i in 0..10 {
             tx.send(i).unwrap();
@@ -1068,7 +1341,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         drop(rx);
         std::thread::sleep(Duration::from_millis(100));
-        let rx2 = feeder.rx(NonZeroUsize::new(10).unwrap()).unwrap();
+        let rx2 = feeder.rx(water(5, 10).0, water(5, 10).1).unwrap();
         let mut sum = 0i32;
         for _ in 0..20 {
             match rx2.try_get_one() {
@@ -1084,7 +1357,7 @@ mod tests {
     #[test]
     fn no_more_work_waits_for_in_flight_items() {
         let feeder = make_feeder::<i32>();
-        let rx = feeder.rx(NonZeroUsize::new(3).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 3).0, water(1, 3).1).unwrap();
         let tx = feeder.tx().unwrap();
         for i in 0..6 {
             tx.send(i).unwrap();
@@ -1101,7 +1374,7 @@ mod tests {
         drop(tx);
         let (batch, rx) = rx_thread.join().unwrap();
         assert_eq!(batch.len(), 3);
-        assert!(feeder.rx(NonZeroUsize::new(1).unwrap()).is_ok());
+        assert!(feeder.rx(water(1, 2).0, water(1, 2).1).is_ok());
         loop {
             match rx.try_get_one() {
                 TryGetOne::Item(_) => {}
@@ -1114,7 +1387,7 @@ mod tests {
         drop(rx);
         std::thread::sleep(Duration::from_millis(100));
         assert!(matches!(
-            feeder.rx(NonZeroUsize::new(1).unwrap()),
+            feeder.rx(water(1, 2).0, water(1, 2).1),
             Err(AccessError::NoMoreWork)
         ));
     }
@@ -1122,7 +1395,7 @@ mod tests {
     #[test]
     fn status_emits_lag_once_then_recovered_once() {
         let (feeder, status_rx) = Feeder::<i32>::builder().build_with_status();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(1).unwrap();
         let _ = rx.get(NonZeroUsize::new(3).unwrap()).unwrap();
@@ -1156,7 +1429,7 @@ mod tests {
     #[test]
     fn status_emits_lifecycle_events() {
         let (feeder, status_rx) = Feeder::<i32>::builder().build_with_status();
-        let rx = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         let tx = feeder.tx().unwrap();
         tx.send(1).unwrap();
         let _ = rx.get_one().unwrap();
@@ -1194,8 +1467,46 @@ mod tests {
     #[test]
     fn receiver_registrations_get_monotonic_ids() {
         let feeder = make_feeder::<i32>();
-        let rx1 = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
-        let rx2 = feeder.rx(NonZeroUsize::new(1).unwrap()).unwrap();
+        let rx1 = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
+        let rx2 = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
         assert!(rx2.id().0 > rx1.id().0);
+    }
+
+    #[cfg(feature = "perf-stats")]
+    mod perf_stats_tests {
+        use super::*;
+
+        #[test]
+        fn reset_stats_clears_counters() {
+            let feeder = make_feeder::<i32>();
+            let rx = feeder.rx(water(1, 2).0, water(1, 2).1).unwrap();
+            let tx = feeder.tx().unwrap();
+            tx.send(1).unwrap();
+            let _ = rx.get_one().unwrap();
+            let snap = feeder.stats_snapshot();
+            assert!(snap.scheduler.ingress_routed > 0 || snap.consumers.items_consumed > 0);
+            feeder.reset_stats();
+            let cleared = feeder.stats_snapshot();
+            assert_eq!(cleared.scheduler.ingress_routed, 0);
+            assert_eq!(cleared.consumers.items_consumed, 0);
+            assert_eq!(cleared.consumers.refill_messages, 0);
+        }
+
+        #[test]
+        fn routed_items_match_consumed() {
+            let feeder = make_feeder::<i32>();
+            let rx = feeder.rx(water(1, 4).0, water(1, 4).1).unwrap();
+            let tx = feeder.tx().unwrap();
+            for i in 0..4 {
+                tx.send(i).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let batch = rx.get(NonZeroUsize::new(4).unwrap()).unwrap();
+            assert_eq!(batch.len(), 4);
+            let snap = feeder.stats_snapshot();
+            let routed = snap.scheduler.ingress_routed + snap.scheduler.recovered_fulfilled;
+            assert_eq!(snap.consumers.items_consumed, 4);
+            assert_eq!(routed, 4);
+        }
     }
 }

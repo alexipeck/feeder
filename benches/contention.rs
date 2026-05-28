@@ -1,3 +1,6 @@
+mod common;
+
+use common::{checksum, expected_totals, make_payload, payload_seed, payloads_per_producer, work_total};
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode,
 };
@@ -8,16 +11,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PAYLOAD_LEN: usize = 64;
+const PAYLOAD_LEN: usize = common::PAYLOAD_LEN;
 const CONSUMER_THREADS: usize = 32;
 const PRODUCER_COUNTS: [usize; 3] = [4, 8, 10];
 const CONSUMER0_BATCH: usize = 3;
-const FEEDER_CONSUMER0_PREFETCH: usize = 9;
-const FEEDER_OTHER_PREFETCH: usize = 3;
+const FEEDER_CONSUMER0_LOW: usize = 4;
+const FEEDER_CONSUMER0_HIGH: usize = 9;
+const FEEDER_OTHER_LOW: usize = 1;
+const FEEDER_OTHER_HIGH: usize = 3;
 const CRITERION_SAMPLES: usize = 10;
 const TUNING_PRODUCERS: usize = 10;
 const TARGET_WALL_SECS: f64 = 10.0;
-const WORK_TOTAL_PAYLOADS: usize = 14_500_000;
 const MEASUREMENT_MARGIN: f64 = 1.2;
 
 fn measurement_budget() -> Duration {
@@ -28,23 +32,6 @@ fn measurement_budget() -> Duration {
             TARGET_WALL_SECS * MEASUREMENT_MARGIN * CRITERION_SAMPLES as f64,
         )
     }
-}
-
-fn work_total() -> usize {
-    if std::env::args().any(|a| a == "--test") {
-        WORK_TOTAL_PAYLOADS / 200
-    } else {
-        WORK_TOTAL_PAYLOADS
-    }
-}
-
-fn payloads_per_producer(producers: usize) -> usize {
-    let total = if std::env::var("TUNE_WORK").is_ok() {
-        WORK_TOTAL_PAYLOADS
-    } else {
-        work_total()
-    };
-    total / producers
 }
 
 fn log_benchmark_topology() {
@@ -59,7 +46,7 @@ fn log_benchmark_topology() {
     eprintln!("  producer counts per case: {:?}", PRODUCER_COUNTS);
     eprintln!("  consumer threads (every case): {CONSUMER_THREADS}");
     eprintln!("  consumer 0 (1 thread):");
-    eprintln!("    feeder:    prefetch={FEEDER_CONSUMER0_PREFETCH}, get(max={CONSUMER0_BATCH})");
+    eprintln!("    feeder:    low={FEEDER_CONSUMER0_LOW},high={FEEDER_CONSUMER0_HIGH}, get(max={CONSUMER0_BATCH})");
     eprintln!("    crossbeam: {CONSUMER0_BATCH} recv() calls per loop iteration");
     eprintln!("    kanal:     {CONSUMER0_BATCH} recv() calls per loop iteration");
     eprintln!(
@@ -67,11 +54,16 @@ fn log_benchmark_topology() {
         CONSUMER_THREADS - 1,
         CONSUMER_THREADS - 1
     );
-    eprintln!("    feeder:    prefetch={FEEDER_OTHER_PREFETCH}, get_one() per loop");
+    eprintln!("    feeder:    low={FEEDER_OTHER_LOW},high={FEEDER_OTHER_HIGH}, get_one() per loop");
     eprintln!("    crossbeam: 1 recv() call per loop iteration");
     eprintln!("    kanal:     1 recv() call per loop iteration");
     eprintln!("  payload type: Vec<u64> len {PAYLOAD_LEN}");
     eprintln!();
+}
+
+#[cfg(feature = "perf-stats")]
+fn feeder_stats_enabled() -> bool {
+    std::env::var("FEEDER_STATS").is_ok_and(|v| v == "1")
 }
 
 fn benchmark_group_name(backend: &str, producers: usize) -> String {
@@ -80,44 +72,16 @@ fn benchmark_group_name(backend: &str, producers: usize) -> String {
 
 fn benchmark_id(backend: &str) -> BenchmarkId {
     let consumer0 = match backend {
-        "feeder" => format!("c0:prefetch={FEEDER_CONSUMER0_PREFETCH},get({CONSUMER0_BATCH})"),
+        "feeder" => format!("c0:low={FEEDER_CONSUMER0_LOW},high={FEEDER_CONSUMER0_HIGH},get({CONSUMER0_BATCH})"),
         "crossbeam" | "kanal" => format!("c0:recv_x{CONSUMER0_BATCH}"),
         _ => "c0:?".to_string(),
     };
     let consumers_rest = match backend {
-        "feeder" => format!("c1-{}:prefetch={FEEDER_OTHER_PREFETCH},get_one", CONSUMER_THREADS - 1),
+        "feeder" => format!("c1-{}:low={FEEDER_OTHER_LOW},high={FEEDER_OTHER_HIGH},get_one", CONSUMER_THREADS - 1),
         "crossbeam" | "kanal" => format!("c1-{}:recv_x1", CONSUMER_THREADS - 1),
         _ => format!("c1-{}:?", CONSUMER_THREADS - 1),
     };
     BenchmarkId::new(consumer0, consumers_rest)
-}
-
-fn make_payload(seed: u64) -> Vec<u64> {
-    (0..PAYLOAD_LEN as u64)
-        .map(|i| seed.wrapping_mul(31).wrapping_add(i))
-        .collect()
-}
-
-fn checksum(payload: &[u64]) -> u64 {
-    payload.iter().fold(0u64, |a, &b| a.wrapping_add(b))
-}
-
-fn payload_seed(producer: usize, seq: u64) -> u64 {
-    (producer as u64) << 32 | seq
-}
-
-fn expected_totals(producers: usize) -> (usize, u64) {
-    let per = payloads_per_producer(producers);
-    let mut count = 0usize;
-    let mut cs = 0u64;
-    for p in 0..producers {
-        for i in 0..per {
-            let payload = make_payload(payload_seed(p, i as u64));
-            cs = cs.wrapping_add(checksum(&payload));
-            count += 1;
-        }
-    }
-    (count, cs)
 }
 
 struct RunTotals {
@@ -128,15 +92,21 @@ struct RunTotals {
 fn run_feeder(producers: usize) -> RunTotals {
     let wall_start = Instant::now();
     let feeder = Feeder::<Vec<u64>>::builder().build();
-    let prefetch9 = NonZeroUsize::new(FEEDER_CONSUMER0_PREFETCH).unwrap();
-    let prefetch3 = NonZeroUsize::new(FEEDER_OTHER_PREFETCH).unwrap();
+    let water0 = (
+        NonZeroUsize::new(FEEDER_CONSUMER0_LOW).unwrap(),
+        NonZeroUsize::new(FEEDER_CONSUMER0_HIGH).unwrap(),
+    );
+    let water_rest = (
+        NonZeroUsize::new(FEEDER_OTHER_LOW).unwrap(),
+        NonZeroUsize::new(FEEDER_OTHER_HIGH).unwrap(),
+    );
     let get_max = NonZeroUsize::new(CONSUMER0_BATCH).unwrap();
     let per_producer = payloads_per_producer(producers);
 
     let mut receivers = Vec::with_capacity(CONSUMER_THREADS);
     for i in 0..CONSUMER_THREADS {
-        let prefetch = if i == 0 { prefetch9 } else { prefetch3 };
-        receivers.push(feeder.rx(prefetch).expect("rx"));
+        let (low, high) = if i == 0 { water0 } else { water_rest };
+        receivers.push(feeder.rx(low, high).expect("rx"));
     }
 
     let tx = feeder.tx().expect("tx");
@@ -201,6 +171,13 @@ fn run_feeder(producers: usize) -> RunTotals {
 
     for h in consumer_handles {
         h.join().unwrap();
+    }
+
+    #[cfg(feature = "perf-stats")]
+    if feeder_stats_enabled() {
+        feeder
+            .stats_snapshot()
+            .print_stderr(&format!("contention/p{producers}"));
     }
 
     let totals = RunTotals {

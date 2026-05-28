@@ -3,6 +3,10 @@ name = "feeder"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+perf-stats = []
+
 [dependencies]
 crossbeam-channel = "0.5"
 thiserror = "2"
@@ -14,3 +18,8 @@ kanal = "0.1"
 [[bench]]
 name = "contention"
 harness = false
+
+[[bench]]
+name = "decompose"
+harness = false
+required-features = ["perf-stats"]

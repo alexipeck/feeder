@@ -4,7 +4,10 @@ use std::num::NonZeroUsize;
 fn main() {
     let feeder = Feeder::<i32>::builder().build();
     let rx = feeder
-        .rx(NonZeroUsize::new(3).unwrap())
+        .rx(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(3).unwrap(),
+        )
         .expect("receiver");
     let tx = feeder.tx().expect("sender");
     for i in 0..10 {
