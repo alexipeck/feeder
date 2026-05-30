@@ -1,3 +1,5 @@
+pub mod feeder_harness;
+
 pub const PAYLOAD_LEN: usize = 64;
 pub const WORK_TOTAL_PAYLOADS: usize = 14_500_000;
 
