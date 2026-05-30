@@ -612,6 +612,33 @@ fn acquire_item<T: Send + 'static, S: StatusSink>(
         if worker_shutting_down(shared) && shutdown_idle(shared) {
             return None;
         }
+        if worker_shutting_down(shared)
+            && shared.ingress_pending.load(Ordering::Acquire) == 0
+            && shared.recovered_pending.load(Ordering::Acquire) == 0
+        {
+            crossbeam_channel::select! {
+                recv(recovered_rx) -> msg => {
+                    match msg {
+                        Ok(item) => {
+                            shared.recovered_pending.fetch_sub(1, Ordering::AcqRel);
+                            shared.active_worker_items.fetch_add(1, Ordering::AcqRel);
+                            #[cfg(feature = "perf-stats")]
+                            shared.scheduler_stats.recovered_routed.fetch_add(1, Ordering::Relaxed);
+                            return Some(item);
+                        }
+                        Err(RecvError) => return None,
+                    }
+                }
+                recv(terminal_rx) -> _ => return None,
+                recv(graceful_wake_rx) -> _ => {
+                    shared.try_complete();
+                }
+                recv(progress_wake_rx) -> _ => {
+                    shared.try_complete();
+                }
+            }
+            continue;
+        }
         crossbeam_channel::select! {
             recv(recovered_rx) -> msg => {
                 match msg {
@@ -769,16 +796,8 @@ fn fulfill_demand<T: Send + 'static, S: StatusSink>(
             graceful_wake_rx,
             progress_wake_rx,
         ) else {
-            if worker_cancelled(shared) {
-                shared.abandon_demand(&receiver, count);
-                return;
-            }
-            if receiver.closing.load(Ordering::SeqCst) {
-                shared.abandon_demand(&receiver, count);
-                return;
-            }
-            if worker_shutting_down(shared) && shutdown_idle(shared) {
-                shared.abandon_demand(&receiver, count);
+            shared.abandon_demand(&receiver, count);
+            if worker_shutting_down(shared) {
                 shared.try_complete();
             }
             return;
@@ -1681,6 +1700,76 @@ mod tests {
             }
         }
         assert_eq!(sum, expected_sum);
+    }
+
+    #[test]
+    fn many_receivers_tuned_water_graceful_shutdown_completes() {
+        let n_consumers = std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(4);
+        let feeder = Feeder::<u64>::builder()
+            .scheduler_threads(NonZeroUsize::new(4).unwrap())
+            .build();
+        let water0 = water(16, 64);
+        let water_rest = water(8, 32);
+        let get_max = NonZeroUsize::new(3).unwrap();
+        let n_producers = 4usize;
+        let per_producer = 500usize;
+        let expected_sum = (0..(n_producers * per_producer) as u64).sum::<u64>();
+
+        let mut receivers = Vec::with_capacity(n_consumers);
+        for i in 0..n_consumers {
+            let (low, high) = if i == 0 { water0 } else { water_rest };
+            receivers.push(feeder.rx(low, high).unwrap());
+        }
+
+        let mut producers = Vec::new();
+        for p in 0..n_producers {
+            let tx = feeder.tx().unwrap();
+            producers.push(std::thread::spawn(move || {
+                let base = (p * per_producer) as u64;
+                for i in 0..per_producer {
+                    tx.send(base + i as u64).unwrap();
+                }
+            }));
+        }
+        for h in producers {
+            h.join().unwrap();
+        }
+        feeder.graceful_shutdown();
+        drop(feeder.tx().unwrap());
+
+        let mut consumers = Vec::new();
+        for (i, rx) in receivers.into_iter().enumerate() {
+            consumers.push(std::thread::spawn(move || {
+                let mut sum = 0u64;
+                if i == 0 {
+                    loop {
+                        match rx.get(get_max) {
+                            Ok(batch) => {
+                                for v in batch {
+                                    sum += v;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                } else {
+                    loop {
+                        match rx.get_one() {
+                            Ok(v) => sum += v,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                sum
+            }));
+        }
+        let mut total = 0u64;
+        for h in consumers {
+            total += h.join().unwrap();
+        }
+        assert_eq!(total, expected_sum);
     }
 
     #[test]
