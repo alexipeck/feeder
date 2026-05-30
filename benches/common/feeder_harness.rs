@@ -53,6 +53,16 @@ pub const TUNED_WATER: WaterMarks = WaterMarks {
     other_high: TUNED_OTHER_HIGH,
 };
 
+pub const UNIFORM_WATER_LOW: usize = 32;
+pub const UNIFORM_WATER_HIGH: usize = 64;
+
+pub const UNIFORM_WATER_32_64: WaterMarks = WaterMarks {
+    consumer0_low: UNIFORM_WATER_LOW,
+    consumer0_high: UNIFORM_WATER_HIGH,
+    other_low: UNIFORM_WATER_LOW,
+    other_high: UNIFORM_WATER_HIGH,
+};
+
 #[derive(Clone, Copy)]
 pub struct FeederBenchConfig {
     pub suffix: &'static str,
@@ -111,6 +121,23 @@ pub const BENEFIT_MATRIX: [FeederBenchConfig; 8] = [
         consumer_mode: ConsumerMode::DrainRest(DRAIN_CONSUMER_BATCH),
     },
 ];
+
+pub const COMBINED_UNIFORM_GET1: FeederBenchConfig = FeederBenchConfig {
+    suffix: "combined_uniform_get1",
+    water: UNIFORM_WATER_32_64,
+    producer_mode: ProducerMode::BatchSend(FEEDER_SEND_BATCH),
+    consumer_mode: ConsumerMode::GetOne,
+};
+
+pub const COMBINED_UNIFORM_GET8: FeederBenchConfig = FeederBenchConfig {
+    suffix: "combined_uniform_get8",
+    water: UNIFORM_WATER_32_64,
+    producer_mode: ProducerMode::BatchSend(FEEDER_SEND_BATCH),
+    consumer_mode: ConsumerMode::DrainRest(DRAIN_CONSUMER_BATCH),
+};
+
+pub const COMBINED_UNIFORM_CONFIGS: [FeederBenchConfig; 2] =
+    [COMBINED_UNIFORM_GET1, COMBINED_UNIFORM_GET8];
 
 pub struct RunTotals {
     pub received: u64,

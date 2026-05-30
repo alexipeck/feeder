@@ -20,6 +20,10 @@ name = "contention"
 harness = false
 
 [[bench]]
+name = "combined_uniform"
+harness = false
+
+[[bench]]
 name = "decompose"
 harness = false
 required-features = ["perf-stats"]
