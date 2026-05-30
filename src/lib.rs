@@ -242,7 +242,7 @@ pub struct FeederRx<T: Send + 'static, S: StatusSink = NoStatus> {
 
 struct ReceiverHandle<T> {
     _receiver_id: ReceiverId,
-    data_tx: Sender<T>,
+    data_tx: Mutex<Option<Sender<T>>>,
     closing: AtomicBool,
     active_sends: AtomicUsize,
     outstanding: AtomicUsize,
@@ -268,6 +268,7 @@ struct Shared<T: Send + 'static, S: StatusSink> {
     active_workers: AtomicUsize,
     cancelled_emitted: AtomicBool,
     no_more_work_emitted: AtomicBool,
+    shutdown_consumers_unstuck: AtomicBool,
     status: S,
     #[cfg(feature = "perf-stats")]
     scheduler_stats: Arc<stats::SchedulerStats>,
@@ -322,6 +323,7 @@ fn build_feeder<T: Send + 'static, S: StatusSink>(
         active_workers: AtomicUsize::new(worker_count),
         cancelled_emitted: AtomicBool::new(false),
         no_more_work_emitted: AtomicBool::new(false),
+        shutdown_consumers_unstuck: AtomicBool::new(false),
         status: status.clone(),
         #[cfg(feature = "perf-stats")]
         scheduler_stats: Arc::clone(&scheduler_stats),
@@ -450,10 +452,51 @@ impl<T: Send + 'static, S: StatusSink> Shared<T, S> {
         let _ = self.terminal_tx.lock().unwrap().take();
     }
 
+    fn disconnect_receiver(&self, handle: &ReceiverHandle<T>) {
+        handle.closing.store(true, Ordering::SeqCst);
+        let outstanding = handle.outstanding.load(Ordering::Acquire);
+        if outstanding > 0 {
+            self.abandon_demand(handle, outstanding);
+        }
+        let _ = handle.data_tx.lock().unwrap().take();
+    }
+
+    fn unstick_shutdown_consumers(&self) {
+        if lifecycle(self) != SHUTTING_DOWN {
+            return;
+        }
+        if self.shutdown_consumers_unstuck.load(Ordering::Acquire) {
+            return;
+        }
+        if self.ingress_pending.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        if self.recovered_pending.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        if self.active_worker_items.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        if self
+            .shutdown_consumers_unstuck
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let registry = self.registry.lock().unwrap();
+        if registry.len() <= 8 {
+            return;
+        }
+        for handle in registry.values() {
+            self.disconnect_receiver(handle);
+        }
+    }
+
     fn mark_all_receivers_closing(&self) {
         let mut registry = self.registry.lock().unwrap();
         for handle in registry.values() {
-            handle.closing.store(true, Ordering::SeqCst);
+            self.disconnect_receiver(handle);
         }
         registry.clear();
     }
@@ -465,9 +508,6 @@ impl<T: Send + 'static, S: StatusSink> Shared<T, S> {
         if self.ingress_pending.load(Ordering::Acquire) != 0 {
             return;
         }
-        if self.demand_pending.load(Ordering::Acquire) != 0 {
-            return;
-        }
         if self.recovered_pending.load(Ordering::Acquire) != 0 {
             return;
         }
@@ -476,6 +516,12 @@ impl<T: Send + 'static, S: StatusSink> Shared<T, S> {
         }
         if self.delivered_inflight.load(Ordering::Acquire) != 0 {
             return;
+        }
+        if self.demand_pending.load(Ordering::Acquire) != 0 {
+            self.unstick_shutdown_consumers();
+            if self.demand_pending.load(Ordering::Acquire) != 0 {
+                return;
+            }
         }
         if self.active_producer_sends.load(Ordering::Acquire) != 0 {
             return;
@@ -756,8 +802,22 @@ fn send_fulfillment_burst<T: Send + 'static, S: StatusSink>(
     let mut fulfilled = 0usize;
     loop {
         shared.delivered_inflight.fetch_add(1, Ordering::AcqRel);
-        match receiver.data_tx.send(item) {
+        let guard = receiver.data_tx.lock().unwrap();
+        let Some(tx) = guard.as_ref() else {
+            drop(guard);
+            shared.delivered_inflight.fetch_sub(1, Ordering::AcqRel);
+            shared.active_worker_items.fetch_sub(1, Ordering::AcqRel);
+            let unsatisfied = *remaining;
+            shared.abandon_demand(receiver, unsatisfied);
+            if !worker_cancelled(shared) {
+                shared.enqueue_recovered(item);
+            }
+            *remaining = 0;
+            break;
+        };
+        match tx.send(item) {
             Ok(()) => {
+                drop(guard);
                 fulfilled += 1;
                 *remaining -= 1;
                 if *remaining == 0 {
@@ -770,6 +830,7 @@ fn send_fulfillment_burst<T: Send + 'static, S: StatusSink>(
                 item = next;
             }
             Err(e) => {
+                drop(guard);
                 shared.delivered_inflight.fetch_sub(1, Ordering::AcqRel);
                 shared.active_worker_items.fetch_sub(1, Ordering::AcqRel);
                 shared.abandon_demand(receiver, 1);
@@ -941,7 +1002,7 @@ impl<T: Send + 'static, S: StatusSink> Feeder<T, S> {
         let (data_tx, data_rx) = crossbeam_channel::unbounded();
         let handle = Arc::new(ReceiverHandle {
             _receiver_id: receiver_id,
-            data_tx,
+            data_tx: Mutex::new(Some(data_tx)),
             closing: AtomicBool::new(false),
             active_sends: AtomicUsize::new(0),
             outstanding: AtomicUsize::new(0),
@@ -1303,6 +1364,14 @@ impl<T: Send + 'static, S: StatusSink> FeederRx<T, S> {
     }
 
     fn maybe_request_refill(&self) {
+        if lifecycle(&self.shared) == SHUTTING_DOWN
+            && self
+                .shared
+                .shutdown_consumers_unstuck
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(handle) = self.handle.upgrade() else {
             return;
         };
@@ -1398,6 +1467,7 @@ impl<T: Send + 'static, S: StatusSink> FeederRx<T, S> {
             .lock()
             .unwrap()
             .remove(&self.receiver_id);
+        let _ = handle.data_tx.lock().unwrap().take();
         spin_until(|| handle.active_sends.load(Ordering::Acquire) == 0);
         let data_rx = self.data_rx.lock().unwrap().take();
         let mut recovered = 0usize;
@@ -1735,6 +1805,80 @@ mod tests {
             }
         }
         assert_eq!(sum, expected_sum);
+    }
+
+    #[test]
+    fn tuned_water_concurrent_consumers_during_shutdown_completes() {
+        let n_consumers = std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(4);
+        let feeder = Feeder::<u64>::builder()
+            .scheduler_threads(NonZeroUsize::new(4).unwrap())
+            .build();
+        let water0 = water(16, 64);
+        let water_rest = water(8, 32);
+        let get_max = NonZeroUsize::new(3).unwrap();
+        let n_producers = 4usize;
+        let per_producer = 72_500usize / n_producers;
+        let expected_count = n_producers * per_producer;
+
+        let mut receivers = Vec::with_capacity(n_consumers);
+        for i in 0..n_consumers {
+            let (low, high) = if i == 0 { water0 } else { water_rest };
+            receivers.push(feeder.rx(low, high).unwrap());
+        }
+
+        let tx = feeder.tx().unwrap();
+        let received_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&received_count);
+
+        let consumer_handles: Vec<_> = receivers
+            .into_iter()
+            .enumerate()
+            .map(|(i, rx)| {
+                let count = Arc::clone(&count);
+                std::thread::spawn(move || {
+                    let mut local = 0usize;
+                    if i == 0 {
+                        loop {
+                            match rx.get(get_max) {
+                                Ok(batch) => local += batch.len(),
+                                Err(_) => break,
+                            }
+                        }
+                    } else {
+                        loop {
+                            match rx.get_one() {
+                                Ok(_) => local += 1,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    count.fetch_add(local, Ordering::Relaxed);
+                })
+            })
+            .collect();
+
+        let producer_handles: Vec<_> = (0..n_producers)
+            .map(|p| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let base = (p * per_producer) as u64;
+                    for i in 0..per_producer {
+                        tx.send(base + i as u64).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in producer_handles {
+            h.join().unwrap();
+        }
+        feeder.graceful_shutdown();
+        drop(tx);
+        for h in consumer_handles {
+            h.join().unwrap();
+        }
+        assert_eq!(received_count.load(Ordering::Relaxed), expected_count);
     }
 
     #[test]
