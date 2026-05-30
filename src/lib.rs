@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(feature = "perf-stats")]
@@ -612,10 +613,31 @@ fn acquire_item<T: Send + 'static, S: StatusSink>(
         if worker_shutting_down(shared) && shutdown_idle(shared) {
             return None;
         }
-        if worker_shutting_down(shared)
-            && shared.ingress_pending.load(Ordering::Acquire) == 0
-            && shared.recovered_pending.load(Ordering::Acquire) == 0
-        {
+        if worker_shutting_down(shared) {
+            shared.try_complete();
+            if shutdown_idle(shared) {
+                return None;
+            }
+            if shared.ingress_pending.load(Ordering::Acquire) == 0
+                && shared.recovered_pending.load(Ordering::Acquire) == 0
+            {
+                return None;
+            }
+            if shared.ingress_pending.load(Ordering::Acquire) > 0 {
+                loop {
+                    match ingress_rx.try_recv() {
+                        Ok(item) => {
+                            shared.ingress_pending.fetch_sub(1, Ordering::AcqRel);
+                            if !worker_cancelled(shared) {
+                                shared.enqueue_recovered(item);
+                            }
+                        }
+                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                shared.try_complete();
+                return None;
+            }
             crossbeam_channel::select! {
                 recv(recovered_rx) -> msg => {
                     match msg {
@@ -636,6 +658,7 @@ fn acquire_item<T: Send + 'static, S: StatusSink>(
                 recv(progress_wake_rx) -> _ => {
                     shared.try_complete();
                 }
+                default(Duration::from_millis(1)) => {}
             }
             continue;
         }
@@ -806,6 +829,15 @@ fn fulfill_demand<T: Send + 'static, S: StatusSink>(
     }
 }
 
+fn abandon_queued_demand<T: Send + 'static, S: StatusSink>(
+    shared: &Shared<T, S>,
+    demand_rx: &Receiver<DemandCommand<T>>,
+) {
+    while let Ok(DemandCommand::Request { receiver, count }) = demand_rx.try_recv() {
+        shared.abandon_demand(&receiver, count);
+    }
+}
+
 fn run_worker<T: Send + 'static, S: StatusSink>(
     shared: Arc<Shared<T, S>>,
     ingress_rx: Receiver<T>,
@@ -830,7 +862,10 @@ fn run_worker<T: Send + 'static, S: StatusSink>(
                             Err(RecvError) => break,
                         }
                     }
-                    recv(terminal_rx) -> _ => break,
+                    recv(terminal_rx) -> _ => {
+                        abandon_queued_demand(&shared, &demand_rx);
+                        break;
+                    }
                     recv(graceful_wake_rx) -> _ => {
                         shared.try_complete();
                         continue;
@@ -1714,7 +1749,7 @@ mod tests {
         let water_rest = water(8, 32);
         let get_max = NonZeroUsize::new(3).unwrap();
         let n_producers = 4usize;
-        let per_producer = 500usize;
+        let per_producer = 72_500usize / n_producers;
         let expected_sum = (0..(n_producers * per_producer) as u64).sum::<u64>();
 
         let mut receivers = Vec::with_capacity(n_consumers);
